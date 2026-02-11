@@ -2,14 +2,14 @@
 r"""
 lector_liquidaciones_to_json_v1.py
 
-- Lee 1 a 5 páginas (JPG/PNG/WEBP o PDF).
+- Lee documentos de múltiples páginas (JPG/PNG/WEBP o PDF).
 - Llama a OpenAI y devuelve un archivo de texto con dos columnas: CONCEPTO|TOTAL.
 - Modo GUI opcional (--gui): ventana simple con estado, barra, tiempo transcurrido y log.
-- Importante: al finalizar OK imprime SOLO la ruta del JSON por stdout (para VB6).
+- Importante: al finalizar OK imprime SOLO la ruta del TXT por stdout (para VB6).
   En error: sale con código != 0 y escribe el mensaje de error en stderr.
 
 Requisitos:
-  pip install openai python-dotenv
+  pip install openai python-dotenv pillow pypdf
 
 Uso:
   python lector_liquidaciones_to_json_v1.py liquidacion.pdf --outdir E:\temp
@@ -55,6 +55,12 @@ try:
     from PIL import Image
 except Exception:
     Image = None
+
+try:
+    from pypdf import PdfReader, PdfWriter
+except Exception:
+    PdfReader = None
+    PdfWriter = None
 
 
 class StatusUI:
@@ -267,8 +273,108 @@ def _ensure_keyword(concept: str, keyword: str) -> str:
         return concept
     return f"{keyword} - {concept}".strip()
 
+
+def _classify_concept_name(concept: str) -> str:
+    """Clasifica con las mismas reglas que el consumidor VB6."""
+    t = _norm_text(concept)
+    if "RET_GAN" in t:
+        return "RET_GAN"
+    if "RET_IIBB" in t:
+        return "RET_IIBB"
+    if "RET_IVA" in t:
+        return "RET_IVA"
+    if "IVA_CREDITO" in t:
+        return "IVA_CREDITO"
+    if "BANCO" in t:
+        return "BANCO"
+    if (
+        "ACREDITADO" in t
+        or "LIQUIDADO" in t
+        or "NETO DE PAGOS" in t
+        or "NETO A COBRAR" in t
+        or "A DEPOSITAR" in t
+    ):
+        return "BANCO"
+    if "ARANCEL" in t or "COMISION" in t or "CARGO" in t:
+        return "GASTO"
+    if "IMPUESTO" in t and "IVA" not in t and "GANANCIAS" not in t and "IIBB" not in t and "INGRESOS" not in t:
+        return "GASTO"
+    if ("GASTO" in t or "COMISION" in t) and "IVA" not in t and "CREDITO" not in t:
+        return "GASTO"
+    if "IVA" in t and ("ARANCEL" in t or "COMISION" in t or "GASTO" in t):
+        return "IVA_CREDITO"
+    if ("IVA" in t and "RET" in t) or ("IVA" in t and "PERCEP" in t) or "R.G. 2408" in t or "RG 2408" in t:
+        return "RET_IVA"
+    if (
+        "INGRESOS" in t
+        or "IIBB" in t
+        or "SIRTAC" in t
+        or "ING.BRUTOS" in t
+        or "ING. BRUTOS" in t
+        or "ING BRUTOS" in t
+    ):
+        return "RET_IIBB"
+    if "GANANCIAS" in t or ("RET" in t and "GAN" in t) or "RG 830" in t:
+        return "RET_GAN"
+    if ("IVA" in t and "CREDITO" in t) or "CRED.FISC" in t or "CRED FISC" in t or ("IVA" in t and "CRED" in t and "FISC" in t):
+        return "IVA_CREDITO"
+    if "TARJETA" in t and "IVA" not in t:
+        return "TARJETA"
+    return "OTROS"
+
+
+def _ensure_keywords_for_category(concept: str, category: str) -> str:
+    if category == "TARJETA":
+        return _ensure_keyword(concept, "TARJETA")
+    if category == "BANCO":
+        return _ensure_keyword(concept, "BANCO")
+    if category == "GASTO":
+        return _ensure_keyword(concept, "GASTO")
+    if category == "IVA_CREDITO":
+        return _ensure_keyword(concept, "IVA CREDITO")
+    if category == "RET_IVA":
+        return _ensure_keyword(concept, "IVA RET")
+    if category == "RET_IIBB":
+        return _ensure_keyword(concept, "IIBB")
+    if category == "RET_GAN":
+        return _ensure_keyword(concept, "GANANCIAS")
+    return _ensure_keyword(concept, "OTROS")
+
+
+def _canonical_label_for_category(category: str) -> str:
+    mapping = {
+        "TARJETA": "TARJETA",
+        "BANCO": "BANCO",
+        "GASTO": "GASTO",
+        "IVA_CREDITO": "IVA_CREDITO",
+        "RET_IVA": "RET_IVA",
+        "RET_IIBB": "RET_IIBB",
+        "RET_GAN": "RET_GAN",
+        "OTROS": "OTROS",
+    }
+    return mapping.get(category, "OTROS")
+
+
+def _normalize_total_for_category(total: str, category: str) -> str:
+    value = _parse_number(total)
+    if category == "TARJETA":
+        value = abs(value)
+    else:
+        value = -abs(value)
+    value = _round2(value)
+    if abs(value) < 0.005:
+        value = 0.0
+    return f"{value:.2f}"
+
 def _postprocess_output(text: str) -> str:
-    lines_in = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    lines_in = []
+    for raw in text.splitlines():
+        ln = raw.strip()
+        if not ln:
+            continue
+        if ln.startswith("```") or ln.startswith("**") or ln == "---":
+            continue
+        lines_in.append(ln)
     if not lines_in:
         return text
 
@@ -295,50 +401,49 @@ def _postprocess_output(text: str) -> str:
     return "\n".join(out) + "\n"
 
 def _apply_keywords_to_main(lines: List[str]) -> List[str]:
-    rules = [
-        ("TARJETA", ["TARJETA"]),
-        ("BANCO", ["BANCO"]),
-        ("GASTOS", ["GASTO", "COMISION"]),
-        ("IVA_CREDITO", ["IVA", "CREDITO"]),
-        ("RET_IVA", ["IVA", "RET"]),
-        ("RET_IIBB", ["INGRESOS", "IIBB"]),
-        ("RET_GAN", ["GANANCIAS"]),
-        ("OTROS", ["OTROS"]),
-    ]
-
-    out: List[str] = []
-    for idx, ln in enumerate(lines):
+    categories = ["TARJETA", "BANCO", "GASTO", "IVA_CREDITO", "RET_IVA", "RET_IIBB", "RET_GAN", "OTROS"]
+    sums: Dict[str, float] = {k: 0.0 for k in categories}
+    row_idx = 0
+    fallback_by_position = {
+        1: "TARJETA",
+        2: "BANCO",
+        3: "GASTO",
+        4: "IVA_CREDITO",
+        5: "RET_IVA",
+        6: "RET_IIBB",
+        7: "RET_GAN",
+        8: "OTROS",
+    }
+    for ln in lines:
         if "|" not in ln:
-            out.append(ln)
             continue
 
         concept, total = ln.split("|", 1)
         concept = concept.strip()
         total = total.strip()
+        t_concept = _norm_text(concept)
+        if t_concept in ("CONCEPTO", "TIPO", "TIPOCONCEPTOIA"):
+            continue
+        # Evita encabezados como CONCEPTO|TOTAL
+        if _norm_text(total) in ("TOTAL", "IMPORTE"):
+            continue
 
-        if idx < len(rules):
-            _, must = rules[idx]
-            t = _norm_text(concept)
-            if not all(k in t for k in must):
-                if idx == 0:
-                    concept = _ensure_keyword(concept, "TARJETA")
-                elif idx == 1:
-                    concept = _ensure_keyword(concept, "BANCO")
-                elif idx == 2:
-                    concept = _ensure_keyword(concept, "GASTO")
-                elif idx == 3:
-                    concept = _ensure_keyword(concept, "IVA CREDITO")
-                elif idx == 4:
-                    concept = _ensure_keyword(concept, "RET IVA")
-                elif idx == 5:
-                    concept = _ensure_keyword(concept, "IIBB")
-                elif idx == 6:
-                    concept = _ensure_keyword(concept, "GANANCIAS")
-                elif idx == 7:
-                    concept = _ensure_keyword(concept, "OTROS")
+        row_idx += 1
+        cat = _classify_concept_name(concept)
+        # Si el modelo devuelve "OTROS" genérico en las primeras filas,
+        # recuperamos la estructura esperada original.
+        if cat == "OTROS" and _norm_text(concept) in ("OTRO", "OTROS", "OTHER"):
+            cat = fallback_by_position.get(row_idx, "OTROS")
+        # Fallback para la línea principal cuando el modelo no incluye la palabra TARJETA.
+        if row_idx == 1 and cat == "OTROS":
+            cat = "TARJETA"
+        sums[cat] += _parse_number(total)
 
+    out: List[str] = []
+    for cat in categories:
+        concept = _canonical_label_for_category(cat)
+        total = _normalize_total_for_category(str(sums[cat]), cat)
         out.append(f"{concept}|{total}")
-
     return out
 
 def _write_log(log_path: Path, msg: str) -> None:
@@ -349,6 +454,7 @@ def _write_log(log_path: Path, msg: str) -> None:
             f.write(f"[{ts}] {msg}\n")
     except Exception:
         pass
+
 
 def _ensure_writable_outdir(preferred: str) -> Path:
     """Devuelve un outdir escribible. Si falla, usa TEMP del sistema."""
@@ -366,6 +472,49 @@ def _ensure_writable_outdir(preferred: str) -> Path:
             return fallback
         except Exception:
             return Path(".")
+
+
+def _ensure_writable_outdir_with_file_fallback(preferred: str, first_input_file: str) -> Path:
+    """Prioriza outdir solicitado; si no se puede, usa carpeta del archivo fuente; último recurso TEMP."""
+    # 1) Intentar outdir solicitado (si viene por parámetro)
+    if preferred and preferred.strip():
+        cand = Path(preferred.strip())
+        try:
+            cand.mkdir(parents=True, exist_ok=True)
+            test_path = cand / f".__write_test_{os.getpid()}_{int(time.time())}.tmp"
+            test_path.write_text("ok", encoding="utf-8")
+            test_path.unlink(missing_ok=True)
+            return cand
+        except Exception:
+            pass
+
+    # 2) Fallback: carpeta del archivo de entrada
+    try:
+        src_dir = Path(first_input_file).resolve().parent
+        src_dir.mkdir(parents=True, exist_ok=True)
+        test_path = src_dir / f".__write_test_{os.getpid()}_{int(time.time())}.tmp"
+        test_path.write_text("ok", encoding="utf-8")
+        test_path.unlink(missing_ok=True)
+        return src_dir
+    except Exception:
+        pass
+
+    # 3) Último recurso: TEMP
+    return _ensure_writable_outdir("")
+
+
+def _ensure_outdir_preferred_or_fail(preferred: str) -> Path:
+    cand = Path((preferred or "").strip())
+    if not str(cand):
+        raise SystemExit("ERROR: outdir solicitado vacío.")
+    try:
+        cand.mkdir(parents=True, exist_ok=True)
+        test_path = cand / f".__write_test_{os.getpid()}_{int(time.time())}.tmp"
+        test_path.write_text("ok", encoding="utf-8")
+        test_path.unlink(missing_ok=True)
+        return cand
+    except Exception as e:
+        raise SystemExit(f"ERROR: No se puede escribir en outdir solicitado: {cand} ({e})")
 
 
 # ----------------------------
@@ -482,8 +631,65 @@ def file_to_content_block(file_path: str) -> Dict[str, Any]:
     raise ValueError(f"Tipo no soportado: {ext}. Usá JPG/PNG/WEBP o PDF.")
 
 
-def file_to_content_blocks(file_path: str, tiles: int = 1) -> List[Dict[str, Any]]:
+def _count_pdf_pages(file_path: str) -> int:
+    if PdfReader is None:
+        return 1
+    try:
+        return max(1, len(PdfReader(file_path).pages))
+    except Exception:
+        return 1
+
+
+def _pdf_to_chunked_blocks(file_path: str, pages_per_chunk: int) -> List[Dict[str, Any]]:
+    pages_per_chunk = int(pages_per_chunk or 0)
+    if pages_per_chunk <= 0:
+        return [file_to_content_block(file_path)]
+
+    if PdfReader is None or PdfWriter is None:
+        raise SystemExit("ERROR: Para dividir PDFs grandes necesitás instalar pypdf: pip install pypdf")
+
+    reader = PdfReader(file_path)
+    total = len(reader.pages)
+    if total <= pages_per_chunk:
+        return [file_to_content_block(file_path)]
+
+    blocks: List[Dict[str, Any]] = []
+    stem = Path(file_path).stem
+    for start in range(0, total, pages_per_chunk):
+        end = min(total, start + pages_per_chunk)
+        writer = PdfWriter()
+        for i in range(start, end):
+            writer.add_page(reader.pages[i])
+
+        buf = io.BytesIO()
+        writer.write(buf)
+        b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+        blocks.append(
+            {
+                "type": "input_file",
+                "filename": f"{stem}_p{start + 1:03d}-{end:03d}.pdf",
+                "file_data": f"data:application/pdf;base64,{b64}",
+            }
+        )
+
+    return blocks
+
+
+def _is_request_too_large_error(exc: Exception) -> bool:
+    """Detecta errores típicos de límite de tamaño/tokens para reintentar en chunks."""
+    msg = str(exc or "").lower()
+    return (
+        "request too large" in msg
+        or "tokens per min" in msg
+        or ("rate_limit_exceeded" in msg and "requested" in msg)
+    )
+
+
+def file_to_content_blocks(file_path: str, tiles: int = 1, pdf_chunk_pages: int = 0) -> List[Dict[str, Any]]:
     ext = Path(file_path).suffix.lower()
+    if ext == ".pdf":
+        return _pdf_to_chunked_blocks(file_path, pdf_chunk_pages)
+
     if tiles <= 1 or ext == ".pdf":
         return [file_to_content_block(file_path)]
 
@@ -523,12 +729,12 @@ def file_to_content_blocks(file_path: str, tiles: int = 1) -> List[Dict[str, Any
 def main() -> None:
     parser = argparse.ArgumentParser(
         add_help=True,
-        description="Lector de liquidaciones -> JSON (1 a 5 páginas). Usa OPENAI_API_KEY (env o .env junto al exe/script).",
+        description="Lector de liquidaciones -> TXT (multipágina). Usa OPENAI_API_KEY (env o .env junto al exe/script).",
     )
-    parser.add_argument("files", nargs="*", help="1 a 5 archivos (imágenes/PDF) en orden de páginas")
+    parser.add_argument("files", nargs="*", help="Archivos de entrada (imágenes/PDF) en orden de páginas")
     parser.add_argument("--outdir", default="", help="Carpeta de salida. Default: TEMP del sistema")
     parser.add_argument("--prompt-file", default="", help="Archivo .txt con prompt personalizado")
-    parser.add_argument("--model", default="gpt-4.1", help="Modelo a usar (default: gpt-4.1)")
+    parser.add_argument("--model", default="gpt-4o-mini", help="Modelo a usar (default: gpt-4o-mini)")
     parser.add_argument("--gui", action="store_true", help="Muestra ventana de progreso (no altera stdout)")
     parser.add_argument(
         "--per-page",
@@ -545,6 +751,12 @@ def main() -> None:
         type=int,
         default=1,
         help="Divide cada página en N franjas horizontales (solo imágenes). Requiere Pillow.",
+    )
+    parser.add_argument(
+        "--pdf-chunk-pages",
+        type=int,
+        default=0,
+        help="Divide PDFs en bloques de N páginas para documentos grandes. 0 = no dividir.",
     )
     args = parser.parse_args()
 
@@ -579,35 +791,53 @@ def main() -> None:
                 )
 
             if not args.files:
-                raise SystemExit("ERROR: Debés pasar 1 a 5 archivos por parámetro.")
-            if len(args.files) > 5:
-                raise SystemExit("ERROR: Máximo 5 archivos.")
+                raise SystemExit("ERROR: Debés pasar al menos 1 archivo por parámetro.")
+            if len(args.files) > 100:
+                raise SystemExit("ERROR: Máximo 100 archivos de entrada.")
 
             if args.tile < 1 or args.tile > 6:
                 raise SystemExit("ERROR: --tile debe ser un entero entre 1 y 6.")
-
-            # Auto-ajuste simple según cantidad de páginas
-            if args.auto:
-                n = len(args.files)
-                if n <= 1:
-                    args.tile = 3
-                    args.per_page = False
-                elif n <= 3:
-                    args.tile = 4
-                    args.per_page = True
-                else:
-                    args.tile = 5
-                    args.per_page = True
+            if args.pdf_chunk_pages < 0:
+                raise SystemExit("ERROR: --pdf-chunk-pages no puede ser negativo.")
 
             status("Validando archivos...")
             for f in args.files:
                 if not Path(f).exists():
                     raise SystemExit(f"ERROR: No existe el archivo: {f}")
 
+            # Auto-ajuste según páginas reales (si se puede leer el PDF).
+            if args.auto:
+                effective_pages = 0
+                for f in args.files:
+                    if Path(f).suffix.lower() == ".pdf":
+                        effective_pages += _count_pdf_pages(f)
+                    else:
+                        effective_pages += 1
+
+                if effective_pages <= 2:
+                    args.tile = 3
+                    args.per_page = False
+                    if args.pdf_chunk_pages == 0:
+                        args.pdf_chunk_pages = 0
+                elif effective_pages <= 8:
+                    args.tile = 4
+                    args.per_page = True
+                    if args.pdf_chunk_pages == 0:
+                        args.pdf_chunk_pages = 4
+                else:
+                    args.tile = 5
+                    args.per_page = True
+                    if args.pdf_chunk_pages == 0:
+                        args.pdf_chunk_pages = 5
+
             status("Preparando salida...")
             base = safe_basename(args.files[0])
             ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-            outdir = _ensure_writable_outdir(args.outdir.strip())
+            requested_outdir = args.outdir.strip()
+            if requested_outdir:
+                outdir = _ensure_outdir_preferred_or_fail(requested_outdir)
+            else:
+                outdir = _ensure_writable_outdir_with_file_fallback("", args.files[0])
             log_path = Path(outdir) / f"{base}_{ts}_log.txt"
             result["log_path"] = str(log_path)
             _write_log(log_path, f"Inicio proceso. Archivos: {', '.join(args.files)}")
@@ -616,16 +846,21 @@ def main() -> None:
             prompt = read_prompt(args.prompt_file.strip() or None)
             if "concepto|total" not in prompt.lower():
                 prompt = "Respondé solo con texto en formato CONCEPTO|TOTAL.\n" + prompt
-            _write_log(log_path, f"Modelo: {args.model} | per-page: {args.per_page} | tile: {args.tile}")
+            _write_log(
+                log_path,
+                f"Modelo: {args.model} | per-page: {args.per_page} | tile: {args.tile} | pdf-chunk-pages: {args.pdf_chunk_pages}",
+            )
 
             status("Armando contenido...")
-            log(f"Modelo: {args.model} | per-page: {args.per_page} | tile: {args.tile}")
+            log(
+                f"Modelo: {args.model} | per-page: {args.per_page} | tile: {args.tile} | pdf-chunk-pages: {args.pdf_chunk_pages}"
+            )
             content = [{"type": "input_text", "text": prompt}]
             total_files = len(args.files)
             for i, f in enumerate(args.files, start=1):
                 status(f"Adjuntando página {i}/{total_files}...")
                 log(f"Archivo: {f}")
-                content.extend(file_to_content_blocks(f, args.tile))
+                content.extend(file_to_content_blocks(f, args.tile, args.pdf_chunk_pages))
 
             status("Analizando con Inteligencia Artificial...")
             log("Motor IA: Activo")
@@ -655,28 +890,55 @@ def main() -> None:
 
                 return out_text.strip()
 
-            if args.per_page and len(args.files) > 1:
+            def build_units(force_pdf_page_split: bool = False) -> List[tuple[str, List[Dict[str, Any]]]]:
+                units: List[tuple[str, List[Dict[str, Any]]]] = []
+                for f in args.files:
+                    ext = Path(f).suffix.lower()
+                    if ext == ".pdf" and (force_pdf_page_split or args.per_page):
+                        chunk = 1 if force_pdf_page_split else (args.pdf_chunk_pages if args.pdf_chunk_pages > 0 else 1)
+                        pdf_blocks = _pdf_to_chunked_blocks(f, chunk)
+                        for b in pdf_blocks:
+                            units.append((f, [b]))
+                    else:
+                        units.append((f, file_to_content_blocks(f, args.tile, args.pdf_chunk_pages)))
+                return units
+
+            def run_units(units: List[tuple[str, List[Dict[str, Any]]]], status_label: str) -> str:
                 page_results: List[str] = []
-                total_files = len(args.files)
-                t_pages_start = time.time()
-                for i, f in enumerate(args.files, start=1):
+                total_units = len(units)
+                t_units_start = time.time()
+                for i, (src, blocks) in enumerate(units, start=1):
                     if i > 1:
-                        elapsed = time.time() - t_pages_start
+                        elapsed = time.time() - t_units_start
                         avg = elapsed / (i - 1)
-                        remaining = avg * (total_files - i + 1)
+                        remaining = avg * (total_units - i + 1)
                         mm = int(remaining // 60)
                         ss = int(remaining % 60)
-                        status(f"IA por página {i}/{total_files}... (ETA ~{mm:02d}:{ss:02d})")
+                        status(f"{status_label} {i}/{total_units}... (ETA ~{mm:02d}:{ss:02d})")
                     else:
-                        status(f"IA por página {i}/{total_files}...")
-                    log(f"Archivo: {f}")
-                    page_content = [{"type": "input_text", "text": prompt}]
-                    page_content.extend(file_to_content_blocks(f, args.tile))
-                    page_results.append(call_model(page_content))
-                # unificar: concatenar salidas con separación de línea
-                data = "\n".join([t for t in page_results if t.strip()])
+                        status(f"{status_label} {i}/{total_units}...")
+                    log(f"Unidad {i}/{total_units}: {src}")
+                    unit_content = [{"type": "input_text", "text": prompt}]
+                    unit_content.extend(blocks)
+                    page_results.append(call_model(unit_content))
+                return "\n".join([t for t in page_results if t.strip()])
+
+            units = build_units(force_pdf_page_split=False)
+            if args.per_page and len(units) > 1:
+                page_results: List[str] = []
+                data = run_units(units, "IA por página/bloque")
             else:
-                data = call_model(content)
+                try:
+                    data = call_model(content)
+                except Exception as e:
+                    if not _is_request_too_large_error(e):
+                        raise
+
+                    _write_log(log_path, f"Reintento automático por tamaño/tokens: {e!r}")
+                    log("Documento grande detectado. Reintentando automáticamente por páginas...")
+                    status("Documento grande: reintentando por páginas...")
+                    retry_units = build_units(force_pdf_page_split=True)
+                    data = run_units(retry_units, "Reintento por página")
 
             data = _postprocess_output(str(data))
 
@@ -685,8 +947,10 @@ def main() -> None:
             try:
                 out_path.write_text(str(data).strip() + "\n", encoding="utf-8")
             except Exception:
-                # fallback a TEMP si falla el outdir
-                outdir = _ensure_writable_outdir("")
+                if requested_outdir:
+                    raise SystemExit(f"ERROR: No se pudo guardar el TXT en outdir solicitado: {requested_outdir}")
+                # fallback: carpeta del archivo de entrada; último recurso TEMP
+                outdir = _ensure_writable_outdir_with_file_fallback("", args.files[0])
                 out_path = Path(outdir) / f"{base}_{ts}.txt"
                 out_path.write_text(str(data).strip() + "\n", encoding="utf-8")
             _write_log(log_path, f"Salida generada: {out_path}")
