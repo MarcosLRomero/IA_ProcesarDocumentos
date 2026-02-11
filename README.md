@@ -67,7 +67,6 @@ python .\lector_facturas_to_json_v5.py fac1.jpg --model gpt-4.1 --outdir E:\temp
 ****************************************************************************************************
 Para liquidaciones, el modelo por defecto es `gpt-4.1`. Podés cambiarlo con `--model`.
 ****************************************************************************************************
-
 ## Uso básico (liquidaciones de tarjetas)
 Genera un archivo de texto con dos columnas: `CONCEPTO|TOTAL`.
 ```powershell
@@ -124,4 +123,3 @@ Con PyInstaller:
 pyinstaller --onefile --noconsole lector_facturas_to_json_v5.py
 pyinstaller --onefile --noconsole lector_liquidaciones_to_json_v1.py
 ```
-# IA_ProcesarDocumentos
