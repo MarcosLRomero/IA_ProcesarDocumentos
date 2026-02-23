@@ -2,11 +2,11 @@
 r"""
 lector_facturas_to_json_v5.py
 
-- Lee 1 a 5 páginas (JPG/PNG/WEBP o PDF).
+- Lee 1 a 5 pÃ¡ginas (JPG/PNG/WEBP o PDF).
 - Llama a OpenAI y devuelve JSON normalizado.
 - Modo GUI opcional (--gui): ventana simple con estado, barra, tiempo transcurrido y log.
 - Importante: al finalizar OK imprime SOLO la ruta del JSON por stdout (para VB6).
-  En error: sale con código != 0 y escribe el mensaje de error en stderr.
+  En error: sale con cÃ³digo != 0 y escribe el mensaje de error en stderr.
 
 Requisitos:
   pip install openai python-dotenv
@@ -25,19 +25,23 @@ import argparse
 import io
 import base64
 import datetime as dt
+import hashlib
+import hmac
 import json
 import os
 import re
+import secrets
 import sys
 import tempfile
 import threading
 import time
 import queue
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
-from openai import OpenAI
 
 
 # ----------------------------
@@ -63,7 +67,7 @@ class StatusUI:
 
     def __init__(self, title="Procesando factura...", width=560, height=260):
         if tk is None or ttk is None:
-            raise RuntimeError("Tkinter no está disponible en este entorno.")
+            raise RuntimeError("Tkinter no estÃ¡ disponible en este entorno.")
 
         self.q: "queue.Queue[str]" = queue.Queue()
         self.t0 = time.time()
@@ -160,9 +164,9 @@ class StatusUI:
 # Utilidades generales
 # ----------------------------
 def app_dir() -> Path:
-    """Carpeta base del .py o del .exe (cuando está 'frozen')."""
+    """Carpeta base del .py o del .exe (cuando estÃ¡ 'frozen')."""
     if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
-        # En PyInstaller, el ejecutable real está en sys.executable
+        # En PyInstaller, el ejecutable real estÃ¡ en sys.executable
         return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parent
 
@@ -215,85 +219,79 @@ def _extract_idcliente_from_files(files: List[str], idcliente_arg: str) -> tuple
     return cleaned, idcliente
 
 
-def _build_sql_conn_str() -> str:
-    user = (os.getenv("SQL_USER") or "").strip()
-    pwd = (os.getenv("SQL_PASSWORD") or "").strip()
-    server = (os.getenv("SQL_SERVER") or "").strip()
-    db = (os.getenv("SQL_DATABASE") or "").strip()
-    driver = (os.getenv("SQL_DRIVER") or "").strip()
-    if not all([user, pwd, server, db, driver]):
-        return ""
-    return (
-        f"DRIVER={{{driver}}};"
-        f"SERVER={server};"
-        f"DATABASE={db};"
-        f"UID={user};"
-        f"PWD={pwd};"
-        "TrustServerCertificate=yes;"
+def _sign_request(secret: str, timestamp: str, nonce: str, body: str) -> str:
+    msg = f"{timestamp}.{nonce}.{body}".encode("utf-8")
+    return hmac.new(secret.encode("utf-8"), msg, hashlib.sha256).hexdigest()
+
+
+def call_backend_response(
+    *,
+    backend_url: str,
+    client_id: str,
+    client_secret: str,
+    model: str,
+    max_output_tokens: int,
+    input_payload: List[Dict[str, Any]],
+    text_payload: Dict[str, Any],
+    idcliente: str,
+    archivo: str,
+    timeout_s: int,
+) -> str:
+    payload: Dict[str, Any] = {
+        "model": model,
+        "max_output_tokens": max_output_tokens,
+        "input": input_payload,
+        "text": text_payload,
+        "metadata": {
+            "idcliente": idcliente,
+            "opcion": "FACTURAS",
+            "archivo": archivo,
+        },
+    }
+    raw_body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    ts = str(int(time.time()))
+    nonce = secrets.token_hex(16)
+    sig = _sign_request(client_secret, ts, nonce, raw_body)
+
+    req = urllib.request.Request(
+        backend_url,
+        data=raw_body.encode("utf-8"),
+        method="POST",
+        headers={
+            "Content-Type": "application/json; charset=utf-8",
+            "X-IA-Client-Id": client_id,
+            "X-IA-Timestamp": ts,
+            "X-IA-Nonce": nonce,
+            "X-IA-Signature": sig,
+        },
     )
 
-
-def save_ia_consulta_sql(
-    idcliente: str,
-    opcion: str,
-    archivo: str,
-    ok: bool,
-    error_msg: str,
-    duracion_ms: int,
-) -> Optional[str]:
-    """Guarda auditoria de consulta IA. Devuelve mensaje de error o None."""
-    if not idcliente:
-        return "idcliente vacio"
-
-    conn_str = _build_sql_conn_str()
-    if not conn_str:
-        return "faltan variables SQL_* en .env"
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            resp_raw = resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as e:
+        err_raw = e.read().decode("utf-8", errors="replace")
+        raise SystemExit(f"ERROR backend IA HTTP {e.code}: {err_raw}") from e
+    except Exception as e:
+        raise SystemExit(f"ERROR backend IA: {e}") from e
 
     try:
-        import pyodbc  # type: ignore
-    except Exception:
-        return "falta pyodbc (pip install pyodbc)"
+        obj = json.loads(resp_raw)
+    except Exception as e:
+        raise SystemExit(f"ERROR backend IA respuesta invalida: {resp_raw[:300]}") from e
 
-    sql_variants = [
-        (
-            "INSERT INTO dbo.IA_ConsultasGPT "
-            "(idcliente, opcion, archivo, ok, error, duracion_ms) VALUES (?, ?, ?, ?, ?, ?)",
-            (int(idcliente), opcion, archivo, 1 if ok else 0, error_msg, int(duracion_ms)),
-        ),
-        (
-            "INSERT INTO dbo.IA_ConsultasGPT "
-            "(idcliente, opcion, archivo_nombre, ok, error, duracion_ms) VALUES (?, ?, ?, ?, ?, ?)",
-            (int(idcliente), opcion, archivo, 1 if ok else 0, error_msg, int(duracion_ms)),
-        ),
-        (
-            "INSERT INTO dbo.IA_ConsultasGPT (idcliente, opcion, archivo) VALUES (?, ?, ?)",
-            (int(idcliente), opcion, archivo),
-        ),
-        (
-            "INSERT INTO dbo.IA_ConsultasGPT (idcliente, opcion, archivo_nombre) VALUES (?, ?, ?)",
-            (int(idcliente), opcion, archivo),
-        ),
-    ]
-
-    last_err = ""
-    for sql, params in sql_variants:
-        try:
-            with pyodbc.connect(conn_str, timeout=5) as conn:
-                cur = conn.cursor()
-                cur.execute(sql, params)
-                conn.commit()
-                return None
-        except Exception as e:
-            last_err = str(e)
-            continue
-
-    return f"no se pudo insertar en IA_ConsultasGPT: {last_err}"
+    if not obj.get("ok"):
+        raise SystemExit(f"ERROR backend IA: {obj.get('error') or 'unknown_error'}")
+    out_text = str(obj.get("output_text") or "").strip()
+    if not out_text:
+        raise SystemExit("ERROR backend IA: respuesta vacia del modelo.")
+    return out_text
 
 
 def sanitize_json_text(s: str) -> str:
     s = s.strip()
-    if s.startswith("﻿"):
-        s = s.lstrip("﻿")
+    if s.startswith("ï»¿"):
+        s = s.lstrip("ï»¿")
     # remove trailing commas before } or ]
     s = re.sub(r",\s*([}\]])", r"\1", s)
     return s
@@ -451,7 +449,7 @@ def normalize_schema(data: dict) -> dict:
 
 
 def infer_orden_columnas(data: dict) -> None:
-    """Completa meta.orden_columnas si viene vacío.
+    """Completa meta.orden_columnas si viene vacÃ­o.
     Intenta tomar "Detalle: ..." desde meta.comprobante_raw u observaciones.
     """
     try:
@@ -487,12 +485,12 @@ def infer_orden_columnas(data: dict) -> None:
         def norm(s: str) -> str:
             s = s.lower().strip()
             s = (
-                s.replace("á", "a")
-                .replace("é", "e")
-                .replace("í", "i")
-                .replace("ó", "o")
-                .replace("ú", "u")
-                .replace("ñ", "n")
+                s.replace("Ã¡", "a")
+                .replace("Ã©", "e")
+                .replace("Ã­", "i")
+                .replace("Ã³", "o")
+                .replace("Ãº", "u")
+                .replace("Ã±", "n")
             )
             s = re.sub(r"\s+", " ", s)
             return s
@@ -699,7 +697,7 @@ def validate_totals_integrity(data: dict, tolerance: float = 0.03) -> None:
             msg = (
                 f"ADVERTENCIA: suma de ROWS.Total ({_format_number_ar(row_sum, 2)}) "
                 f"no coincide con Neto/Total ({_format_number_ar(target, 2)}). "
-                f"Desvío {diff*100:.2f}%."
+                f"DesvÃ­o {diff*100:.2f}%."
             )
             obs = str(meta.get("observaciones") or "")
             meta["observaciones"] = (obs + " | " if obs else "") + msg
@@ -798,8 +796,8 @@ def dedupe_rows(rows: List[dict]) -> List[dict]:
 # Prompt
 # ----------------------------
 DEFAULT_PROMPT = r"""
-Vas a analizar 1 a 5 páginas de una factura / comprobante de compra.
-Respondé **SOLO** con JSON válido (sin texto adicional).
+Vas a analizar 1 a 5 pÃ¡ginas de una factura / comprobante de compra.
+RespondÃ© **SOLO** con JSON vÃ¡lido (sin texto adicional).
 
 El JSON debe tener ESTE formato fijo (NO elimines claves):
 
@@ -867,9 +865,9 @@ El JSON debe tener ESTE formato fijo (NO elimines claves):
 REGLAS IMPORTANTES:
 - NO inventes datos.
 - Si algo no se ve o no es seguro, dejalo "".
-- Respetá formato de números y fechas tal como aparece.
-- Si hay varias páginas, unificá en un solo JSON final.
-- Respondé SOLO JSON.
+- RespetÃ¡ formato de nÃºmeros y fechas tal como aparece.
+- Si hay varias pÃ¡ginas, unificÃ¡ en un solo JSON final.
+- RespondÃ© SOLO JSON.
 """
 
 
@@ -882,7 +880,7 @@ def read_prompt(prompt_file: Optional[str]) -> str:
 
 
 # ----------------------------
-# Conversión de archivos a bloques para OpenAI
+# ConversiÃ³n de archivos a bloques para OpenAI
 # ----------------------------
 def file_to_content_block(file_path: str) -> Dict[str, Any]:
     ext = Path(file_path).suffix.lower()
@@ -906,7 +904,7 @@ def file_to_content_block(file_path: str) -> Dict[str, Any]:
             "file_data": f"data:application/pdf;base64,{b64}",
         }
 
-    raise ValueError(f"Tipo no soportado: {ext}. Usá JPG/PNG/WEBP o PDF.")
+    raise ValueError(f"Tipo no soportado: {ext}. UsÃ¡ JPG/PNG/WEBP o PDF.")
 
 
 
@@ -916,7 +914,7 @@ def file_to_content_blocks(file_path: str, tiles: int = 1) -> List[Dict[str, Any
         return [file_to_content_block(file_path)]
 
     if Image is None:
-        raise SystemExit("ERROR: Para --tile necesitás instalar Pillow: pip install pillow")
+        raise SystemExit("ERROR: Para --tile necesitÃ¡s instalar Pillow: pip install pillow")
 
     if ext not in (".jpg", ".jpeg", ".png", ".webp"):
         return [file_to_content_block(file_path)]
@@ -951,9 +949,9 @@ def file_to_content_blocks(file_path: str, tiles: int = 1) -> List[Dict[str, Any
 def main() -> None:
     parser = argparse.ArgumentParser(
         add_help=True,
-        description="Lector de facturas -> JSON (1 a 5 páginas). Usa OPENAI_API_KEY (env o .env junto al exe/script).",
+        description="Lector de facturas -> JSON (1 a 5 pÃ¡ginas). Usa backend IA firmado (wsAlfa).",
     )
-    parser.add_argument("files", nargs="*", help="1 a 5 archivos (imágenes/PDF) en orden de páginas")
+    parser.add_argument("files", nargs="*", help="1 a 5 archivos (imÃ¡genes/PDF) en orden de pÃ¡ginas")
     parser.add_argument("--idcliente", default="", help="ID de cliente para trazabilidad")
     parser.add_argument("--outdir", default="", help="Carpeta de salida. Default: TEMP del sistema")
     parser.add_argument("--prompt-file", default="", help="Archivo .txt con prompt personalizado")
@@ -997,24 +995,23 @@ def main() -> None:
     result = {"out_path": None, "error": None}
 
     def worker():
-        audit_started_at = time.time()
-        audit_ok = False
-        audit_error = ""
         try:
             status("Cargando .env / variables...")
             load_env_near_app()
 
-            api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
-            if not api_key:
+            backend_url = (os.getenv("IA_BACKEND_URL") or "http://alfanet.ddns.net:8805/v1/process").strip()
+            backend_client_id = (os.getenv("IA_BACKEND_CLIENT_ID") or "").strip()
+            backend_client_secret = (os.getenv("IA_BACKEND_CLIENT_SECRET") or "").strip()
+            backend_timeout = int(os.getenv("IA_BACKEND_TIMEOUT_SECONDS") or "180")
+            if not backend_client_id or not backend_client_secret:
                 raise SystemExit(
-                    "ERROR: No está configurada OPENAI_API_KEY. "
-                    "Creá un .env junto al exe/script con OPENAI_API_KEY=... o definila como variable de entorno."
+                    "ERROR: Faltan IA_BACKEND_CLIENT_ID/IA_BACKEND_CLIENT_SECRET en .env del cliente."
                 )
 
             if not args.files:
-                raise SystemExit("ERROR: Debés pasar 1 a 5 archivos por parámetro.")
+                raise SystemExit("ERROR: DebÃ©s pasar 1 a 5 archivos por parÃ¡metro.")
             if len(args.files) > 5:
-                raise SystemExit("ERROR: Máximo 5 archivos.")
+                raise SystemExit("ERROR: MÃ¡ximo 5 archivos.")
 
             if args.idcliente and not re.fullmatch(r"\d{3,20}", args.idcliente):
                 raise SystemExit("ERROR: idcliente invalido. Debe contener solo digitos.")
@@ -1055,44 +1052,31 @@ def main() -> None:
             content = [{"type": "input_text", "text": prompt}]
             total_files = len(args.files)
             for i, f in enumerate(args.files, start=1):
-                status(f"Adjuntando página {i}/{total_files}...")
+                status(f"Adjuntando pÃ¡gina {i}/{total_files}...")
                 log(f"Archivo: {f}")
                 content.extend(file_to_content_blocks(f, args.tile))
 
             status("Analizando con Inteligencia Artificial...")
-            audit_started_at = time.time()
             log("Motor IA: Activo")
             if args.idcliente:
                 log(f"idcliente: {args.idcliente}")
-            client = OpenAI(api_key=api_key)
+            log(f"Backend IA: {backend_url}")
 
             def call_model(content_blocks: List[Dict[str, Any]]) -> dict:
-                req: Dict[str, Any] = {
-                    "model": args.model,
-                    "max_output_tokens": 16000,  # tablas largas
-                    "input": [{"role": "user", "content": content_blocks}],
-                    "text": {"format": {"type": "json_object"}},
-                }
-                if args.idcliente:
-                    req["metadata"] = {
-                        "idcliente": args.idcliente,
-                        "opcion": "FACTURAS",
-                        "archivo": Path(args.files[0]).name,
-                    }
-                resp = client.responses.create(**req)
-
-                out_text = ""
-                try:
-                    out_text = resp.output[0].content[0].text
-                except Exception:
-                    # fallback: juntar textos si vinieron en partes
-                    parts = []
-                    for item in getattr(resp, "output", []) or []:
-                        for c in getattr(item, "content", []) or []:
-                            t = getattr(c, "text", None)
-                            if t:
-                                parts.append(t)
-                    out_text = "\n".join(parts)
+                if not args.idcliente:
+                    raise SystemExit("ERROR: Debes informar --idcliente para auditar en API.")
+                out_text = call_backend_response(
+                    backend_url=backend_url,
+                    client_id=backend_client_id,
+                    client_secret=backend_client_secret,
+                    model=args.model,
+                    max_output_tokens=16000,
+                    input_payload=[{"role": "user", "content": content_blocks}],
+                    text_payload={"format": {"type": "json_object"}},
+                    idcliente=args.idcliente,
+                    archivo=Path(args.files[0]).name,
+                    timeout_s=backend_timeout,
+                )
 
                 try:
                     data = extract_first_json(out_text)
@@ -1110,7 +1094,7 @@ def main() -> None:
                 total_files = len(args.files)
                 t_pages_start = time.time()
                 for i, f in enumerate(args.files, start=1):
-                    # ETA aproximado basado en promedio por página procesada
+                    # ETA aproximado basado en promedio por pÃ¡gina procesada
                     if i > 1:
                         elapsed = time.time() - t_pages_start
                         avg = elapsed / (i - 1)
@@ -1139,34 +1123,18 @@ def main() -> None:
             out_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
             result["out_path"] = str(out_path)
-            audit_ok = True
-            status("Listo ✅")
+            status("Listo âœ…")
             log(f"Generado: {out_path}")
 
         except SystemExit as e:
             result["error"] = str(e)
-            audit_error = str(e)
         except Exception as e:
             result["error"] = f"ERROR: {e!r}"
-            audit_error = result["error"]
-
-        if args.idcliente and args.files:
-            duracion_ms = max(0, int((time.time() - audit_started_at) * 1000))
-            sql_err = save_ia_consulta_sql(
-                idcliente=args.idcliente,
-                opcion="FACTURAS",
-                archivo=Path(args.files[0]).name,
-                ok=audit_ok,
-                error_msg=audit_error,
-                duracion_ms=duracion_ms,
-            )
-            if sql_err:
-                log(f"WARN SQL: {sql_err}")
 
         if ui:
-            # que se llegue a ver el “Listo” o el error
+            # que se llegue a ver el â€œListoâ€ o el error
             if result["error"]:
-                ui.push("STATUS:Error ❌")
+                ui.push("STATUS:Error âŒ")
                 ui.push(result["error"])
             time.sleep(0.8)
             ui.close()

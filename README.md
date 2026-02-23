@@ -1,12 +1,12 @@
-﻿# IA_ProcesarDocumentos
+# IA_ProcesarDocumentos
 
-Scripts para leer documentos (imágenes o PDF) y devolver JSON normalizado usando OpenAI.
+Scripts para leer documentos (imÃ¡genes o PDF) y devolver JSON normalizado usando OpenAI.
 
 ## Requisitos
 - Python 3.10+ (recomendado 3.11)
-- API key en `OPENAI_API_KEY` (env o `.env` junto al script)
+- Backend IA `wsAlfa` en ejecuciÃ³n
 
-## Instalación
+## InstalaciÃ³n
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
@@ -17,17 +17,16 @@ pip install -r requirements.txt
 ## Variables de entorno
 Crear un archivo `.env` en la carpeta del proyecto con:
 ```
-OPENAI_API_KEY=tu_api_key
+IA_BACKEND_URL=http://alfanet.ddns.net:8805/v1/process
+IA_BACKEND_CLIENT_ID=cliente_demo
+IA_BACKEND_CLIENT_SECRET=cambiar_por_secreto_largo
+IA_BACKEND_TIMEOUT_SECONDS=180
 
-# SQL para auditoría de consultas IA (tabla IA_ConsultasGPT en ALFA_CENTRAL)
-SQL_USER=IA
-SQL_PASSWORD=1
-SQL_SERVER=10.56.0.1
-SQL_DATABASE=ALFA_CENTRAL
-SQL_DRIVER=SQL Server Native Client 10.0
+# Si usÃ¡s flujo directo en otros scripts, podÃ©s dejar tambiÃ©n:
+OPENAI_API_KEY=tu_api_key
 ```
 
-## Uso básico (facturas)
+## Uso bÃ¡sico (facturas)
 ```powershell
 python .\lector_facturas_to_json_v5.py factura.pdf --outdir E:\temp
 ```
@@ -37,12 +36,12 @@ python .\lector_facturas_to_json_v5.py factura.pdf --outdir E:\temp
 python .\lector_facturas_to_json_v5.py factura.pdf --idcliente 112010001 --outdir E:\temp
 ```
 
-Compatibilidad (también aceptado):
+Compatibilidad (tambiÃ©n aceptado):
 ```powershell
 python .\lector_facturas_to_json_v5.py factura.pdf Cliente: 112010001 --outdir E:\temp
 ```
 
-## Varias páginas (imágenes)
+## Varias pÃ¡ginas (imÃ¡genes)
 ```powershell
 python .\lector_facturas_to_json_v5.py fac1.jpg fac2.jpg --outdir E:\temp
 ```
@@ -57,16 +56,16 @@ python .\lector_facturas_to_json_v5.py fac1.jpg fac2.jpg --prompt-file E:\DocPro
 python .\lector_facturas_to_json_v5.py fac1.jpg --outdir E:\temp --gui
 ```
 
-## Modo por página (mejora tablas largas)
+## Modo por pÃ¡gina (mejora tablas largas)
 ```powershell
 python .\lector_facturas_to_json_v5.py fac1.jpg fac2.jpg --outdir E:\temp --per-page
 ```
 
 ## Auto-ajuste (tile + per-page)
-Auto-ajusta parámetros según cantidad de páginas:
-- 1 página: `tile=3`, `per-page` OFF
-- 2-3 páginas: `tile=4`, `per-page` ON
-- 4+ páginas: `tile=5`, `per-page` ON
+Auto-ajusta parÃ¡metros segÃºn cantidad de pÃ¡ginas:
+- 1 pÃ¡gina: `tile=3`, `per-page` OFF
+- 2-3 pÃ¡ginas: `tile=4`, `per-page` ON
+- 4+ pÃ¡ginas: `tile=5`, `per-page` ON
 ```powershell
 python .\lector_facturas_to_json_v5.py fac1.jpg fac2.jpg --outdir E:\temp --auto
 ```
@@ -82,15 +81,15 @@ python .\lector_facturas_to_json_v5.py fac1.jpg fac2.jpg --outdir E:\temp --per-
 python .\lector_facturas_to_json_v5.py fac1.jpg --model gpt-4.1 --outdir E:\temp
 ```
 ****************************************************************************************************
-Para liquidaciones, el modelo por defecto es `gpt-4.1`. Podés cambiarlo con `--model`.
+Para liquidaciones, el modelo por defecto es `gpt-4.1`. PodÃ©s cambiarlo con `--model`.
 ****************************************************************************************************
-## Uso básico (liquidaciones de tarjetas)
+## Uso bÃ¡sico (liquidaciones de tarjetas)
 Genera un archivo de texto con dos columnas: `CONCEPTO|TOTAL`.
 ```powershell
 python .\lector_liquidaciones_to_json_v1.py liquidacion.pdf --outdir E:\temp
 ```
 
-## Varias páginas (liquidaciones)
+## Varias pÃ¡ginas (liquidaciones)
 ```powershell
 python .\lector_liquidaciones_to_json_v1.py img1.jpg img2.jpg --outdir E:\temp
 ```
@@ -105,7 +104,7 @@ python .\lector_liquidaciones_to_json_v1.py liquidacion.pdf --prompt-file E:\Doc
 python .\lector_liquidaciones_to_json_v1.py liquidacion.pdf --outdir E:\temp --gui
 ```
 
-## Modo por página (liquidaciones)
+## Modo por pÃ¡gina (liquidaciones)
 ```powershell
 python .\lector_liquidaciones_to_json_v1.py img1.jpg img2.jpg --outdir E:\temp --per-page
 ```
@@ -116,22 +115,22 @@ python .\lector_liquidaciones_to_json_v1.py img1.jpg img2.jpg --outdir E:\temp -
 ```
 
 ## Notas
-- `--tile` solo aplica a imágenes (JPG/PNG/WEBP). Para PDF se ignora.
-- Máximo 5 archivos por ejecución.
+- `--tile` solo aplica a imÃ¡genes (JPG/PNG/WEBP). Para PDF se ignora.
+- MÃ¡ximo 5 archivos por ejecuciÃ³n.
 - Para liquidaciones, la salida es `.txt` con formato `CONCEPTO|TOTAL`.
-- Se valida integridad básica: suma de `ROWS.Total` vs `TOTALES.Neto gravado` (o `TOTALES.Total`). Si el desvío supera 3%, se agrega una advertencia en `meta.observaciones`.
+- Se valida integridad bÃ¡sica: suma de `ROWS.Total` vs `TOTALES.Neto gravado` (o `TOTALES.Total`). Si el desvÃ­o supera 3%, se agrega una advertencia en `meta.observaciones`.
 - Si en el texto aparece "Cantidad de items: N" y se detectan menos filas, se agrega una advertencia en `meta.observaciones`.
 
 ## Troubleshooting
 ### Error: `No module named 'openai'`
-Activá el entorno y reinstalá dependencias:
+ActivÃ¡ el entorno y reinstalÃ¡ dependencias:
 ```powershell
 .\.venv\Scripts\Activate.ps1
 python -m pip install -r requirements.txt
 ```
 
 ### Error PyInstaller en Server 2012: `Failed to load Python DLL ... python311.dll`
-Server 2012 no soporta Python 3.11. Rebuild con Python 3.10 x64 y usá `--onedir`.
+Server 2012 no soporta Python 3.11. Rebuild con Python 3.10 x64 y usÃ¡ `--onedir`.
 
 
 ## Empaquetado (opcional)
