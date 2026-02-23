@@ -18,11 +18,28 @@ pip install -r requirements.txt
 Crear un archivo `.env` en la carpeta del proyecto con:
 ```
 OPENAI_API_KEY=tu_api_key
+
+# SQL para auditoría de consultas IA (tabla IA_ConsultasGPT en ALFA_CENTRAL)
+SQL_USER=IA
+SQL_PASSWORD=1
+SQL_SERVER=10.56.0.1
+SQL_DATABASE=ALFA_CENTRAL
+SQL_DRIVER=SQL Server Native Client 10.0
 ```
 
 ## Uso básico (facturas)
 ```powershell
 python .\lector_facturas_to_json_v5.py factura.pdf --outdir E:\temp
+```
+
+## Enviar cliente (recomendado)
+```powershell
+python .\lector_facturas_to_json_v5.py factura.pdf --idcliente 112010001 --outdir E:\temp
+```
+
+Compatibilidad (también aceptado):
+```powershell
+python .\lector_facturas_to_json_v5.py factura.pdf Cliente: 112010001 --outdir E:\temp
 ```
 
 ## Varias páginas (imágenes)

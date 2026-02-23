@@ -182,6 +182,114 @@ def safe_basename(file_path: str) -> str:
     name = re.sub(r"[^a-zA-Z0-9_\-]+", "_", name).strip("_")
     return name or "factura"
 
+def _extract_idcliente_from_files(files: List[str], idcliente_arg: str) -> tuple[List[str], str]:
+    """Compatibilidad: permite pasar `Cliente: 112010001` entre argumentos posicionales."""
+    cleaned: List[str] = []
+    idcliente = (idcliente_arg or "").strip()
+    i = 0
+
+    while i < len(files):
+        token = (files[i] or "").strip()
+        low = token.lower()
+
+        if low.startswith("cliente:"):
+            val = token.split(":", 1)[1].strip()
+            if not val and (i + 1) < len(files):
+                val = (files[i + 1] or "").strip()
+                i += 1
+            if val and not idcliente:
+                idcliente = val
+            i += 1
+            continue
+
+        if low in ("cliente", "idcliente") and (i + 1) < len(files):
+            val = (files[i + 1] or "").strip()
+            if val and not idcliente:
+                idcliente = val
+            i += 2
+            continue
+
+        cleaned.append(files[i])
+        i += 1
+
+    return cleaned, idcliente
+
+
+def _build_sql_conn_str() -> str:
+    user = (os.getenv("SQL_USER") or "").strip()
+    pwd = (os.getenv("SQL_PASSWORD") or "").strip()
+    server = (os.getenv("SQL_SERVER") or "").strip()
+    db = (os.getenv("SQL_DATABASE") or "").strip()
+    driver = (os.getenv("SQL_DRIVER") or "").strip()
+    if not all([user, pwd, server, db, driver]):
+        return ""
+    return (
+        f"DRIVER={{{driver}}};"
+        f"SERVER={server};"
+        f"DATABASE={db};"
+        f"UID={user};"
+        f"PWD={pwd};"
+        "TrustServerCertificate=yes;"
+    )
+
+
+def save_ia_consulta_sql(
+    idcliente: str,
+    opcion: str,
+    archivo: str,
+    ok: bool,
+    error_msg: str,
+    duracion_ms: int,
+) -> Optional[str]:
+    """Guarda auditoria de consulta IA. Devuelve mensaje de error o None."""
+    if not idcliente:
+        return "idcliente vacio"
+
+    conn_str = _build_sql_conn_str()
+    if not conn_str:
+        return "faltan variables SQL_* en .env"
+
+    try:
+        import pyodbc  # type: ignore
+    except Exception:
+        return "falta pyodbc (pip install pyodbc)"
+
+    sql_variants = [
+        (
+            "INSERT INTO dbo.IA_ConsultasGPT "
+            "(idcliente, opcion, archivo, ok, error, duracion_ms) VALUES (?, ?, ?, ?, ?, ?)",
+            (int(idcliente), opcion, archivo, 1 if ok else 0, error_msg, int(duracion_ms)),
+        ),
+        (
+            "INSERT INTO dbo.IA_ConsultasGPT "
+            "(idcliente, opcion, archivo_nombre, ok, error, duracion_ms) VALUES (?, ?, ?, ?, ?, ?)",
+            (int(idcliente), opcion, archivo, 1 if ok else 0, error_msg, int(duracion_ms)),
+        ),
+        (
+            "INSERT INTO dbo.IA_ConsultasGPT (idcliente, opcion, archivo) VALUES (?, ?, ?)",
+            (int(idcliente), opcion, archivo),
+        ),
+        (
+            "INSERT INTO dbo.IA_ConsultasGPT (idcliente, opcion, archivo_nombre) VALUES (?, ?, ?)",
+            (int(idcliente), opcion, archivo),
+        ),
+    ]
+
+    last_err = ""
+    for sql, params in sql_variants:
+        try:
+            with pyodbc.connect(conn_str, timeout=5) as conn:
+                cur = conn.cursor()
+                cur.execute(sql, params)
+                conn.commit()
+                return None
+        except Exception as e:
+            last_err = str(e)
+            continue
+
+    return f"no se pudo insertar en IA_ConsultasGPT: {last_err}"
+
+
 def sanitize_json_text(s: str) -> str:
     s = s.strip()
     if s.startswith("﻿"):
@@ -846,6 +954,7 @@ def main() -> None:
         description="Lector de facturas -> JSON (1 a 5 páginas). Usa OPENAI_API_KEY (env o .env junto al exe/script).",
     )
     parser.add_argument("files", nargs="*", help="1 a 5 archivos (imágenes/PDF) en orden de páginas")
+    parser.add_argument("--idcliente", default="", help="ID de cliente para trazabilidad")
     parser.add_argument("--outdir", default="", help="Carpeta de salida. Default: TEMP del sistema")
     parser.add_argument("--prompt-file", default="", help="Archivo .txt con prompt personalizado")
     parser.add_argument("--model", default="gpt-4.1-mini", help="Modelo a usar (default: gpt-4.1-mini)")
@@ -867,6 +976,7 @@ def main() -> None:
         help="Divide cada pagina en N franjas horizontales (solo imagenes). Requiere Pillow.",
     )
     args = parser.parse_args()
+    args.files, args.idcliente = _extract_idcliente_from_files(args.files, args.idcliente)
 
     ui = None
     if args.gui:
@@ -887,6 +997,9 @@ def main() -> None:
     result = {"out_path": None, "error": None}
 
     def worker():
+        audit_started_at = time.time()
+        audit_ok = False
+        audit_error = ""
         try:
             status("Cargando .env / variables...")
             load_env_near_app()
@@ -902,6 +1015,9 @@ def main() -> None:
                 raise SystemExit("ERROR: Debés pasar 1 a 5 archivos por parámetro.")
             if len(args.files) > 5:
                 raise SystemExit("ERROR: Máximo 5 archivos.")
+
+            if args.idcliente and not re.fullmatch(r"\d{3,20}", args.idcliente):
+                raise SystemExit("ERROR: idcliente invalido. Debe contener solo digitos.")
 
             if args.tile < 1 or args.tile > 6:
                 raise SystemExit("ERROR: --tile debe ser un entero entre 1 y 6.")
@@ -944,16 +1060,26 @@ def main() -> None:
                 content.extend(file_to_content_blocks(f, args.tile))
 
             status("Analizando con Inteligencia Artificial...")
+            audit_started_at = time.time()
             log("Motor IA: Activo")
+            if args.idcliente:
+                log(f"idcliente: {args.idcliente}")
             client = OpenAI(api_key=api_key)
 
             def call_model(content_blocks: List[Dict[str, Any]]) -> dict:
-                resp = client.responses.create(
-                    model=args.model,
-                    max_output_tokens=16000,  # tablas largas
-                    input=[{"role": "user", "content": content_blocks}],
-                    text={"format": {"type": "json_object"}},
-                )
+                req: Dict[str, Any] = {
+                    "model": args.model,
+                    "max_output_tokens": 16000,  # tablas largas
+                    "input": [{"role": "user", "content": content_blocks}],
+                    "text": {"format": {"type": "json_object"}},
+                }
+                if args.idcliente:
+                    req["metadata"] = {
+                        "idcliente": args.idcliente,
+                        "opcion": "FACTURAS",
+                        "archivo": Path(args.files[0]).name,
+                    }
+                resp = client.responses.create(**req)
 
                 out_text = ""
                 try:
@@ -1013,13 +1139,29 @@ def main() -> None:
             out_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
             result["out_path"] = str(out_path)
+            audit_ok = True
             status("Listo ✅")
             log(f"Generado: {out_path}")
 
         except SystemExit as e:
             result["error"] = str(e)
+            audit_error = str(e)
         except Exception as e:
             result["error"] = f"ERROR: {e!r}"
+            audit_error = result["error"]
+
+        if args.idcliente and args.files:
+            duracion_ms = max(0, int((time.time() - audit_started_at) * 1000))
+            sql_err = save_ia_consulta_sql(
+                idcliente=args.idcliente,
+                opcion="FACTURAS",
+                archivo=Path(args.files[0]).name,
+                ok=audit_ok,
+                error_msg=audit_error,
+                duracion_ms=duracion_ms,
+            )
+            if sql_err:
+                log(f"WARN SQL: {sql_err}")
 
         if ui:
             # que se llegue a ver el “Listo” o el error

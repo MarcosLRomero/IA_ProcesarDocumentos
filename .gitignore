@@ -4,3 +4,10 @@ __pycache__/
 *.pyc
 build/
 dist/
+.json
+.pdf
+*.log
+*.csv
+*.xlsx
+*.zip
+*.tar.gz
